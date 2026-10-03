@@ -34,11 +34,22 @@ dependencies {
     implementation gradleApi()
     implementation 'com.google.guava:guava:17.0'
     implementation 'org.ow2.asm:asm-debug-all:5.0.3'
+    testImplementation 'junit:junit:4.13.2'
     deployerJars 'org.apache.maven.wagon:wagon-ftp:2.7'
 }
 
 processResources {
    from 'LICENSE.txt'
+}
+
+// The tests exercise methods which need a real Project, and Gradle's
+// ProjectBuilder injects synthetic classes into the build classloader. That
+// requires access which is closed by default from Java 9 onwards, so open it
+// up when running on a modular JDK. Java 8 does not understand --add-opens.
+test {
+   if (JavaVersion.current().isJava9Compatible()) {
+      jvmArgs '--add-opens', 'java.base/java.lang=ALL-UNNAMED'
+   }
 }
 
 jar.manifest.mainAttributes (
