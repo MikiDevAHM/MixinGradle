@@ -83,6 +83,25 @@ class MixinExtensionTest {
         }
         '''
 
+    /**
+     * A refmap which describes the same class as the Java refmap, with a
+     * different mapping for the shared member plus one of its own.
+     */
+    private static final String OVERLAPPING_REFMAP = '''\
+        {
+            "mappings": {
+                "com/example/jmixin/mixin/JavaMixin": {
+                    "updateEntityActionState": "func_zzzz_yy",
+                    "secondOnly": "func_second_only"
+                }
+            },
+            "data": {
+                "searge": {},
+                "notch": {}
+            }
+        }
+        '''
+
     private MixinExtension createExtension() {
         Project project = ProjectBuilder.builder().build()
         return new MixinExtension(project)
@@ -123,6 +142,35 @@ class MixinExtensionTest {
                 merged.mappings['com/example/jmixin/mixin/JavaMixin'].handler
         assertEquals 'func_aaaa_bb',
                 merged.mappings['com/example/ktmixin/mixin/KotlinMixin'].kotlinHandler
+    }
+
+    /**
+     * Both processor tasks can describe the same class, because kapt is handed
+     * the Java sources of a sourceSet as well as javac being handed them, so
+     * merging must cope with overlapping refmaps. Where the two disagree about
+     * a member the mapping merged first wins, as both compute the same mapping
+     * for the same target, but members which only one of them describes must
+     * still be carried over.
+     */
+    @Test
+    void keepsFirstMappingWhenRefMapsOverlap() {
+        MixinExtension extension = this.createExtension()
+        File javaRefMap = this.writeRefMap('main-java.refmap.json', JAVA_REFMAP)
+        File overlapping = this.writeRefMap('main-overlapping.refmap.json', OVERLAPPING_REFMAP)
+        File target = new File(this.temporaryFolder.root, 'merged/main.refmap.json')
+
+        extension.mergeRefMaps([javaRefMap, overlapping], target)
+
+        def merged = new JsonSlurper().parse(target)
+        assertEquals 'the mapping merged first must win',
+                'func_70626_be',
+                merged.mappings['com/example/jmixin/mixin/JavaMixin'].updateEntityActionState
+        assertEquals 'a member only the second refmap describes must survive',
+                'func_second_only',
+                merged.mappings['com/example/jmixin/mixin/JavaMixin'].secondOnly
+        assertEquals 'the shared member from the first refmap must survive',
+                'func_xxxx_yy',
+                merged.mappings['com/example/jmixin/mixin/JavaMixin'].handler
     }
 
     /**
