@@ -25,6 +25,8 @@
 package org.spongepowered.asm.gradle.plugins
 
 import com.google.common.io.Files
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
 import groovy.transform.PackageScope
 import org.gradle.api.InvalidUserDataException
 import org.gradle.api.Project
@@ -46,6 +48,39 @@ import static org.spongepowered.asm.gradle.plugins.ReobfMappingType.SEARGE
  * of the mixin annotation processor and extensions to sourcesets 
  */
 class MixinExtension {
+
+    /**
+     * Id of the Kotlin Gradle plugin. Only ever used as a string so that this
+     * plugin does not need a compile time dependency on it.
+     */
+    private static final String KOTLIN_PLUGIN_ID = 'org.jetbrains.kotlin.jvm'
+    
+    /**
+     * Id of the plugin which adds kapt, kapt is what actually runs the
+     * annotation processor for Kotlin sources.
+     */
+    private static final String KAPT_PLUGIN_ID = 'kotlin-kapt'
+    
+    /**
+     * Id which the Kotlin Gradle plugin uses for the options of the kapt
+     * subplugin. Options contributed under this id are handed to the annotation
+     * processor.
+     */
+    private static final String KAPT_SUBPLUGIN_ID = 'org.jetbrains.kotlin.kapt3'
+    
+    /**
+     * Name of the class which holds the compiler subplugin options of a Kotlin
+     * compile task. It is created reflectively so that the Kotlin Gradle plugin
+     * is not needed on this plugin's classpath.
+     */
+    private static final String COMPILER_PLUGIN_CONFIG_CLASS = 'org.jetbrains.kotlin.gradle.plugin.CompilerPluginConfig'
+    
+    /**
+     * Name of the class which represents a single compiler subplugin option. It
+     * is created reflectively so that the Kotlin Gradle plugin is not needed on
+     * this plugin's classpath.
+     */
+    private static final String SUBPLUGIN_OPTION_CLASS = 'org.jetbrains.kotlin.gradle.plugin.SubpluginOption'
     
     class ReobfTask {
         final Project project
@@ -178,6 +213,18 @@ class MixinExtension {
     private Set<Object> importLibs = []
     
     /**
+     * Set when the Kotlin Gradle plugin has been applied to the project,
+     * regardless of the order in which it was applied relative to this plugin.
+     */
+    boolean kotlinApplied
+    
+    /**
+     * Set when the kapt plugin has been applied to the project. Without kapt
+     * there is nothing to run the annotation processor for Kotlin sources.
+     */
+    boolean kaptApplied
+    
+    /**
      * ctor
      * 
      * @param project reference to the containing project
@@ -195,6 +242,20 @@ class MixinExtension {
         Project project = this.project
         def sourceSets = this.sourceSets
         
+        // Detect the Kotlin plugins through withPlugin rather than by inspecting
+        // the applied plugin set, so that the result does not depend on whether
+        // the Kotlin plugins were applied before or after this one. Both are
+        // referenced purely by id, so the Kotlin Gradle plugin never has to be on
+        // the buildscript classpath for this plugin to work.
+        project.pluginManager.withPlugin(KOTLIN_PLUGIN_ID) {
+            this.kotlinApplied = true
+        }
+        
+        project.pluginManager.withPlugin(KAPT_PLUGIN_ID) {
+            this.kaptApplied = true
+            this.enableJavacAnnotationProcessing()
+        }
+        
         this.project.afterEvaluate {
             // Gather reobf jars for processing
             project.reobf.each { reobfTaskWrapper ->
@@ -208,12 +269,17 @@ class MixinExtension {
                 }
             }
 
-            // Search for upstream projects and add our jars to their target set
-            project.configurations.compile.allDependencies.withType(ProjectDependency) { upstream ->
-                def mixinExt = upstream.dependencyProject.extensions.findByName("mixin")
-                if (mixinExt) {
-                    project.reobf.each { reobfTaskWrapper ->
-                        mixinExt.reobfTasks += new ReobfTask(project, reobfTaskWrapper)
+            // Search for upstream projects and add our jars to their target set.
+            // The 'compile' configuration only exists on Gradle < 7, so look it
+            // up defensively instead of assuming it is there.
+            def compileConfiguration = project.configurations.findByName('compile')
+            if (compileConfiguration != null) {
+                compileConfiguration.allDependencies.withType(ProjectDependency) { upstream ->
+                    def mixinExt = upstream.dependencyProject.extensions.findByName("mixin")
+                    if (mixinExt) {
+                        project.reobf.each { reobfTaskWrapper ->
+                            mixinExt.reobfTasks += new ReobfTask(project, reobfTaskWrapper)
+                        }
                     }
                 }
             }
@@ -498,12 +564,16 @@ class MixinExtension {
      * @param set SourceSet to add
      */
     void configure(SourceSet set) {
+        // Captured in a local because it is referenced from the closures below
+        Project project = this.project
+        
         // Check whether this sourceSet was already added
         if (this.sourceSets.contains(set)) {
             project.logger.info "Not adding {} to mixin processor, sourceSet already added", set
             return
         }
-
+        this.sourceSets.add(set)
+        
         project.logger.info "Adding {} to mixin processor", set
         
         // Get the sourceSet's compile task
@@ -514,61 +584,80 @@ class MixinExtension {
         
         // Don't perform default behaviour, a sourceSet has been added manually
         this.applyDefault = false
-
+        
         // For closures below
         def refMaps = this.refMaps
         
-        // Refmap file
-        def refMapFile = project.file("${compileTask.temporaryDir}/${compileTask.name}-refmap.json")
+        // Every task which runs the Mixin annotation processor for this
+        // sourceSet. For a pure Java sourceSet this is just the JavaCompile
+        // task, but Kotlin sources are compiled by kapt (which runs javac, and
+        // therefore the annotation processor, itself) so that task needs to be
+        // configured in exactly the same way as the Java one.
+        def processorTasks = this.getProcessorTasks(set)
         
-        // Srg files
-        def srgFiles = [
-            (ReobfMappingType.SEARGE): project.file("${compileTask.temporaryDir}/mcp-srg.srg"),
-            (ReobfMappingType.NOTCH): project.file("${compileTask.temporaryDir}/mcp-notch.srg")
-        ]
+        this.warnOnMissingKapt(set, processorTasks)
         
-        // Add our vars as extension properties to the sourceSet and compile
-        // tasks, this will allow them to be used in the build script if needed
-        compileTask.ext.outSrgFile = srgFiles[SEARGE]
-        compileTask.ext.outNotchFile = srgFiles[NOTCH]
-        compileTask.ext.refMapFile = refMapFile
-        set.ext.refMapFile = refMapFile
-        compileTask.ext.refMap = set.ext.refMap.toString()
-        
-        // Closure to prepare AP environment before compile task runs
-        compileTask.doFirst {
-            if (!this.disableRefMapWarning && refMaps[compileTask.ext.refMap]) {
-                project.logger.warn "Potential refmap conflict. Duplicate refmap name {} specified for sourceSet {}, already defined for sourceSet {}",
-                    compileTask.ext.refMap, set.name, refMaps[compileTask.ext.refMap]
-            } else {
-                refMaps[compileTask.ext.refMap] = set.name
+        // ForgeGradle only makes the Java compilation depend on the task which
+        // deobfuscates the Minecraft jar, so kapt has to be given the same
+        // dependency explicitly. Without this, kapt runs before the deobfuscated
+        // jar (and the SRG files derived from it) are available.
+        processorTasks.each { procTask ->
+            if (this.isKaptTask(procTask)) {
+                this.dependOnDeobfuscatedJar(procTask)
             }
-            
-            refMapFile.delete()
-            srgFiles.each {
-                it.value.delete()
-            }
-            this.applyCompilerArgs(compileTask)
         }
-
-        // Refmap is generated with a generic name, rename to
-        // artefact-specific name ready for inclusion into target jar. We
+        
+        // Refmap file, per processing task. Each task gets its own file (in its
+        // own temporary directory) so that multiple processors cannot clobber
+        // each other's output, they get merged into a single refmap once all of
+        // the processing tasks have run.
+        def refMapFiles = []
+        
+        // Srg files, per processing task
+        def srgFiles = [:]
+        
+        processorTasks.each { procTask ->
+            def procTmpDir = this.getTemporaryDir(procTask)
+            def procRefMapFile = project.file("${procTmpDir}/${procTask.name}-refmap.json")
+            def procSrgFiles = [
+                (SEARGE): project.file("${procTmpDir}/mcp-srg.srg"),
+                (NOTCH): project.file("${procTmpDir}/mcp-notch.srg")
+            ]
+            
+            refMapFiles += procRefMapFile
+            srgFiles[procTask] = procSrgFiles
+            
+            // Add our vars as extension properties to the sourceSet and compile
+            // tasks, this will allow them to be used in the build script if needed
+            procTask.ext.outSrgFile = procSrgFiles[SEARGE]
+            procTask.ext.outNotchFile = procSrgFiles[NOTCH]
+            procTask.ext.refMapFile = procRefMapFile
+            procTask.ext.refMap = set.ext.refMap.toString()
+            set.ext.refMapFile = procRefMapFile
+            
+            // Closure to prepare AP environment before compile task runs
+            procTask.doFirst {
+                if (!this.disableRefMapWarning && refMaps[procTask.ext.refMap] && refMaps[procTask.ext.refMap] != set.name) {
+                    project.logger.warn "Potential refmap conflict. Duplicate refmap name {} specified for sourceSet {}, already defined for sourceSet {}",
+                        procTask.ext.refMap, set.name, refMaps[procTask.ext.refMap]
+                } else {
+                    refMaps[procTask.ext.refMap] = set.name
+                }
+                
+                procRefMapFile.delete()
+                procSrgFiles.each {
+                    it.value.delete()
+                }
+                this.applyCompilerArgs(procTask)
+            }
+        }
+        
+        // The refmaps are generated with generic names, they get merged into an
+        // artefact-specific name ready for inclusion into the target jar. We
         // can't use rename in the jar spec because there may be multiple
         // refmaps with the same source name
-        File artefactSpecificRefMap = new File(refMapFile.parentFile, compileTask.ext.refMap)
-
-        // Closure to rename generated refMap to artefact-specific refmap when
-        // compile task is completed
-        compileTask.doLast {
-            // Delete the old one
-            artefactSpecificRefMap.delete()
-
-            // Copy the new one if it was successfully generated
-            if (compileTask.ext.refMapFile.exists()) {
-                Files.copy(refMapFile, artefactSpecificRefMap) 
-            }
-        }
-
+        File artefactSpecificRefMap = new File(this.getTemporaryDir(compileTask), compileTask.ext.refMap)
+        
         // Closure to allocate generated AP resources once compile task
         // is completed
         this.reobfTasks.each { reobfTask ->
@@ -577,16 +666,18 @@ class MixinExtension {
                     def mapped = false
                     [reobfTask.taskWrapper.mappingType, this.defaultObfuscationEnv.toString()].each { arg ->
                         ReobfMappingType.each { type ->
-                            if (type.matches(arg) && !mapped && srgFiles[type].exists()) {
-                                this.addMappings(reobfTask, type, srgFiles[type])
+                            def available = this.getSrgFiles(srgFiles, type)
+                            if (type.matches(arg) && !mapped && available.size() > 0) {
+                                this.addMappings(reobfTask, type, available)
                                 mapped = true
                             }
                         }
                     }
     
                     // No mapping set was matched, so add the searge mappings
-                    if (!mapped && srgFiles[SEARGE].exists()) {
-                        this.addMappings(reobfTask, SEARGE, srgFiles[SEARGE])
+                    def searge = this.getSrgFiles(srgFiles, SEARGE)
+                    if (!mapped && searge.size() > 0) {
+                        this.addMappings(reobfTask, SEARGE, searge)
                     }
                 } catch (MissingPropertyException ex) {
                     if (ex.property == "mappingType") {
@@ -597,32 +688,44 @@ class MixinExtension {
                 }
             }
         }
-
-
+        
         // Add the refmap to all reobf'd jars
         this.reobfTasks.each { reobfTask ->
-            reobfTask.jar.getRefMaps().files.add(artefactSpecificRefMap)
-            reobfTask.jar.from(artefactSpecificRefMap)
+            def jarTask = reobfTask.jar
+            
+            // Merge the refmaps generated by each of the processing tasks into
+            // the artefact-specific refmap. This is done in a doFirst on the jar
+            // task so that every processing task has completed (and therefore
+            // written its refmap) by the time that the jar is assembled.
+            jarTask.doFirst {
+                this.mergeRefMaps(refMapFiles, artefactSpecificRefMap)
+            }
+            
+            jarTask.getRefMaps().files.add(artefactSpecificRefMap)
+            jarTask.from(artefactSpecificRefMap)
         }
-
+        
     }
     
     /**
-     * Callback from <tt>compileTask.doLast</tt> closure, attempts to contribute
-     * mappings of the specified type to the supplied task
+     * Attempts to contribute mappings of the specified type to the supplied task.
+     * A sourceSet can have more than one task running the annotation processor
+     * (for example when it contains both Java and Kotlin sources), in which case
+     * every SRG file generated by one of them is contributed.
      * 
      * @param reobfTask a <tt>ReobfTask</tt> instance
      * @param type Mapping type to add
-     * @param srgFile SRG mapping file to add to the task
+     * @param srgFiles SRG mapping files to add to the task
      */
-    @PackageScope void addMappings(ReobfTask reobfTask, ReobfMappingType type, File srgFile) {
-        if (!srgFile.exists()) {
-            project.logger.warn "Unable to contribute {} mappings to {}, the specified file ({}) was not found", type, reobfTask.name, srgFile
-            return    
+    @PackageScope void addMappings(ReobfTask reobfTask, ReobfMappingType type, List<File> srgFiles) {
+        if (srgFiles.size() == 0) {
+            return
         }
         
-        project.logger.info "Contributing {} ({}) mappings to {} in {}", type, srgFile, reobfTask.name, reobfTask.project
-        reobfTask.taskWrapper.extraFiles(srgFile)
+        for (File srgFile : srgFiles) {
+            project.logger.info "Contributing {} ({}) mappings to {} in {}", type, srgFile, reobfTask.name, reobfTask.project
+            reobfTask.taskWrapper.extraFiles(srgFile)
+        }
     }
     
     /**
@@ -630,54 +733,368 @@ class MixinExtension {
      * annotation processor arguments based on the settings configured in this
      * extension.
      * 
-     * @param compileTask Compile task to modify
+     * @param procTask Task running the annotation processor to modify, this is
+     *        either a <tt>JavaCompile</tt> task or a kapt task
      */
-    @PackageScope void applyCompilerArgs(JavaCompile compileTask) {
-        compileTask.options.compilerArgs += [
+    @PackageScope void applyCompilerArgs(Object procTask) {
+        // The arguments are built up as javac-style arguments first. They are
+        // then handed to whichever task is actually running the annotation
+        // processor, since javac and kapt accept them in different ways.
+        def arguments = [
             "-AreobfSrgFile=${this.getReobfSrgFile().canonicalPath}",
             "-AreobfNotchSrgFile=${this.getReobfNotchSrgFile().canonicalPath}",
-            "-AoutSrgFile=${compileTask.outSrgFile.canonicalPath}",
-            "-AoutNotchSrgFile=${compileTask.outNotchFile.canonicalPath}",
-            "-AoutRefMapFile=${compileTask.refMapFile.canonicalPath}"
+            "-AoutSrgFile=${procTask.outSrgFile.canonicalPath}",
+            "-AoutNotchSrgFile=${procTask.outNotchFile.canonicalPath}",
+            "-AoutRefMapFile=${procTask.refMapFile.canonicalPath}"
         ]
         
         if (this.disableTargetValidator) {
-            compileTask.options.compilerArgs += '-AdisableTargetValidator=true'
+            arguments += '-AdisableTargetValidator=true'
         }
         
         if (this.disableTargetExport) {
-            compileTask.options.compilerArgs += '-AdisableTargetExport=true'
+            arguments += '-AdisableTargetExport=true'
         }
         
         if (this.disableOverwriteChecker) {
-            compileTask.options.compilerArgs += '-AdisableOverwriteChecker=true'
+            arguments += '-AdisableOverwriteChecker=true'
         }
         
         if (this.overwriteErrorLevel != null) {
-            compileTask.options.compilerArgs += '-AoverwriteErrorLevel=${this.overwriteErrorLevel.toString().trim()}'
+            arguments += '-AoverwriteErrorLevel=${this.overwriteErrorLevel.toString().trim()}'
         }
         
         if (this.defaultObfuscationEnv != null) {
-            compileTask.options.compilerArgs += "-AdefaultObfuscationEnv=${this.defaultObfuscationEnv.toLowerCase()}"
+            arguments += "-AdefaultObfuscationEnv=${this.defaultObfuscationEnv.toLowerCase()}"
         }
         
         if (this.tokens.size() > 0) {
-            compileTask.options.compilerArgs += this.tokenArgument
+            arguments += this.tokenArgument
         }
         
         if (this.extraSrgFiles.size() > 0) {
-            compileTask.options.compilerArgs += this.getSrgsArgument("reobfSrgFiles", this.extraSrgFiles)
+            arguments += this.getSrgsArgument("reobfSrgFiles", this.extraSrgFiles)
         }
         
         if (this.extraNotchFiles.size() > 0) {
-            compileTask.options.compilerArgs += this.getSrgsArgument("reobfNotchSrgFiles", this.extraNotchFiles)
+            arguments += this.getSrgsArgument("reobfNotchSrgFiles", this.extraNotchFiles)
         }
 
-        File importsFile = this.generateImportsFile(compileTask)
+        File importsFile = this.generateImportsFile(procTask)
         if (importsFile != null) {
-            compileTask.options.compilerArgs += "-AdependencyTargetsFile=${importsFile.canonicalPath}"
-        }    
+            arguments += "-AdependencyTargetsFile=${importsFile.canonicalPath}"
+        }
+        
+        if (this.isKaptTask(procTask)) {
+            // kapt does not run javac directly, it runs the annotation processor
+            // in its own worker and hands the processor options to it as plain
+            // 'key=value' pairs instead of as '-Akey=value' compiler arguments.
+            // They are contributed as subplugin options for the kapt plugin id,
+            // which is the mechanism kapt itself uses for the options from its
+            // own 'arguments' block, so that both keys and values survive.
+            def config = Class.forName(COMPILER_PLUGIN_CONFIG_CLASS).getDeclaredConstructor().newInstance()
+            
+            for (String argument : arguments) {
+                def separator = argument.indexOf('=')
+                def key = argument.substring(2, separator)
+                def value = argument.substring(separator + 1)
+                
+                config.addPluginArgument(KAPT_SUBPLUGIN_ID, this.newSubpluginOption(key, value))
+            }
+            
+            procTask.kaptPluginOptions.add(config)
+        } else {
+            procTask.options.compilerArgs += arguments
+        }
     }
+    
+    /**
+     * Creates a compiler subplugin option, reflectively so that the Kotlin
+     * Gradle plugin is not needed on this plugin's classpath.
+     * 
+     * @param key Option key
+     * @param value Option value
+     * @return new subplugin option instance
+     */
+    private Object newSubpluginOption(String key, String value) {
+        return Class.forName(SUBPLUGIN_OPTION_CLASS).getDeclaredConstructor(String, String).newInstance(key, value)
+    }
+
+    /**
+     * Asks kapt to leave the annotation processing of Java compilation enabled.
+     *
+     * By default kapt disables annotation processing on the Java compile task,
+     * because it expects every processor to be declared through the 'kapt'
+     * configuration and run over the Kotlin sources. That would leave any Java
+     * sources in a mixed sourceSet completely unprocessed, so the processors
+     * have to be declared for both 'annotationProcessor' and 'kapt' in that case.
+     * Since this plugin configures the Java compile task with the Mixin
+     * processor options either way, kapt is asked to keep javac's annotation
+     * processing enabled so that the two work together.
+     */
+    @PackageScope void enableJavacAnnotationProcessing() {
+        // Located dynamically because the Kotlin Gradle plugin is not a
+        // dependency of this plugin, and skipped entirely when kapt does not
+        // expose the setting.
+        def kaptExtension = project.extensions.findByName('kapt')
+        if (kaptExtension == null || !kaptExtension.hasProperty('keepJavacAnnotationProcessors')) {
+            return
+        }
+        
+        kaptExtension.keepJavacAnnotationProcessors = true
+    }
+    
+    /**
+     * Gets every task which runs the Mixin annotation processor for the given
+     * sourceSet. For a Java-only sourceSet this is just the JavaCompile task,
+     * but Kotlin sources are handled by kapt (which runs the annotation
+     * processor itself, since the Kotlin compiler does not), so the kapt task is
+     * included as well when kapt is available.
+     * 
+     * @param set SourceSet to inspect
+     * @return list of tasks which run the annotation processor
+     */
+    @PackageScope List<Object> getProcessorTasks(SourceSet set) {
+        def processorTasks = []
+        processorTasks += project.tasks[set.compileJavaTaskName]
+        
+        Object kaptTask = this.getKaptTask(set)
+        if (kaptTask != null) {
+            processorTasks += kaptTask
+        }
+        
+        return processorTasks
+    }
+    
+    /**
+     * Locates the kapt task for the given sourceSet, without requiring the
+     * Kotlin Gradle plugin to be on the classpath. Returns null when kapt is not
+     * applied, the task does not exist, or the task does not look like a kapt
+     * task.
+     * 
+     * @param set SourceSet to inspect
+     * @return the kapt task for the sourceSet or null
+     */
+    @PackageScope Object getKaptTask(SourceSet set) {
+        if (!this.kaptApplied) {
+            return null
+        }
+        
+        // kapt names its tasks after the Kotlin compilation rather than after
+        // the Gradle sourceSet, so the task for the 'main' sourceSet is called
+        // 'kaptKotlin' rather than 'kaptMain'. The tasks are therefore matched
+        // up using the source set name that each kapt task reports for itself.
+        for (Object task : project.tasks) {
+            if (!this.isKaptTask(task)) {
+                continue
+            }
+            
+            if (this.getKaptSourceSetName(task) == set.name) {
+                return task
+            }
+        }
+        
+        return null
+    }
+    
+    /**
+     * Gets the name of the sourceSet which the given kapt task processes.
+     * 
+     * @param kaptTask kapt task to inspect
+     * @return name of the sourceSet the task processes, or null if unavailable
+     */
+    @PackageScope String getKaptSourceSetName(Object kaptTask) {
+        if (!kaptTask.hasProperty('sourceSetName')) {
+            return null
+        }
+        
+        try {
+            return kaptTask.sourceSetName.getOrNull()
+        } catch (MissingPropertyException ex) {
+            return null
+        }
+    }
+    
+    /**
+     * Determines whether the given task is a kapt task, that is a task which
+     * runs the annotation processor for Kotlin sources. This is done by feature
+     * detection rather than by checking the task class, so that the Kotlin
+     * Gradle plugin does not need to be present on the classpath.
+     * 
+     * @param task Task to inspect
+     * @return true if the task is a kapt task
+     */
+    @PackageScope boolean isKaptTask(Object task) {
+        // javac takes its processor options as compiler arguments, kapt
+        // collects them as compiler subplugin options instead, so a task which
+        // supports the latter is a kapt task. Only the tasks which actually run
+        // the processor have this property, the kapt stub generation task (which
+        // only runs the Kotlin compiler) does not.
+        return !(task instanceof JavaCompile) && task.hasProperty('kaptPluginOptions')
+    }
+    
+    /**
+     * Warns if the given sourceSet contains Kotlin sources but kapt is not
+     * available to run the annotation processor over them. Without this the
+     * build fails later on with a much less obvious error, since Mixin
+     * annotations in Kotlin sources would simply be ignored.
+     * 
+     * @param set SourceSet to inspect
+     * @param processorTasks Tasks which run the annotation processor
+     */
+    @PackageScope void warnOnMissingKapt(SourceSet set, List<Object> processorTasks) {
+        if (!this.kotlinApplied) {
+            return
+        }
+        
+        if (processorTasks.any { this.isKaptTask(it) }) {
+            return
+        }
+        
+        if (this.getKotlinSourceDirs(set).size() == 0) {
+            return
+        }
+        
+        project.logger.warn "SourceSet {} contains Kotlin sources but the kapt plugin is not applied, " +
+            "the Mixin annotation processor will not be run over them. Apply the 'kotlin-kapt' plugin " +
+            "and add the Mixin annotation processor to the 'kapt' configuration.", set.name
+    }
+    
+    /**
+     * Gets the source directories which the Kotlin plugin contributes to the
+     * given sourceSet. Returns an empty list when the sourceSet has no Kotlin
+     * sources, or when the Kotlin plugin is not applied.
+     * 
+     * @param set SourceSet to inspect
+     * @return list of Kotlin source directories
+     */
+    @PackageScope List<File> getKotlinSourceDirs(SourceSet set) {
+        Project project = this.project
+        
+        // The Kotlin plugin adds a source directory set called 'kotlin' to each
+        // sourceSet. It is looked up dynamically because the Kotlin plugin is not
+        // a dependency of this plugin.
+        def kotlinSourceSet = set.extensions.findByName('kotlin')
+        if (kotlinSourceSet == null) {
+            return []
+        }
+        
+        try {
+            return kotlinSourceSet.srcDirs.collect { project.file(it) }
+        } catch (MissingPropertyException ex) {
+            return []
+        }
+    }
+    
+    /**
+     * Makes the given task depend on the ForgeGradle task which deobfuscates the
+     * Minecraft jar, if such a task is present.
+     * 
+     * @param kaptTask Task to add the dependency to
+     */
+    @PackageScope void dependOnDeobfuscatedJar(Object kaptTask) {
+        def deobfTask = project.tasks.findByName('deobfMcMCP')
+        if (deobfTask == null) {
+            return
+        }
+        
+        kaptTask.dependsOn(deobfTask)
+    }
+    
+    /**
+     * Gets the directory which the given task should use for its intermediate
+     * outputs. Tasks which do not have a temporary directory of their own (kapt
+     * tasks, for example) get one allocated under the build directory.
+     * 
+     * @param task Task to get the temporary directory for
+     * @return directory for the task's intermediate files
+     */
+    @PackageScope File getTemporaryDir(Object task) {
+        if (task.hasProperty('temporaryDir')) {
+            return task.temporaryDir
+        }
+        
+        return new File(project.buildDir, "tmp/${task.name}")
+    }
+    
+    /**
+     * Collects the SRG files of the given type which were generated by any of
+     * the annotation processor tasks for a sourceSet. A sourceSet can have
+     * several of these (one per task) when it mixes Java and Kotlin sources.
+     * 
+     * @param srgFiles SRG files, keyed by the task which generated them
+     * @param type Mapping type to collect
+     * @return list of existing SRG files of the requested type
+     */
+    @PackageScope List<File> getSrgFiles(Map<Object, Map> srgFiles, ReobfMappingType type) {
+        return srgFiles.values().collect { it[type] }.findAll { it != null && it.exists() }
+    }
+    
+    /**
+     * Merges the refmaps generated by each of the annotation processor tasks for
+     * a sourceSet into a single refmap. A sourceSet which mixes Java and Kotlin
+     * sources produces one refmap per task, and only a merged refmap describes
+     * every mapping in the sourceSet.
+     * 
+     * @param refMapFiles Refmaps generated by the annotation processor tasks
+     * @param target File to write the merged refmap to
+     */
+    @PackageScope void mergeRefMaps(List<File> refMapFiles, File target) {
+        def generated = refMapFiles.findAll { it.exists() }
+        if (generated.size() == 0) {
+            target.delete()
+            return
+        }
+        
+        def slurper = new JsonSlurper()
+        def merged = [:]
+        
+        for (File refMapFile : generated) {
+            def current = slurper.parse(refMapFile)
+            if (!(current instanceof Map)) {
+                continue
+            }
+            merged = this.mergeRefMapNodes(merged, current)
+        }
+        
+        if (merged.isEmpty()) {
+            project.logger.warn "No refmap content was generated for {}, no refmap will be included in the artefact", target.name
+            target.delete()
+            return
+        }
+        
+        target.parentFile.mkdirs()
+        target.newWriter().withWriter { writer ->
+            writer.write(JsonOutput.prettyPrint(JsonOutput.toJson(merged)))
+        }
+        
+        project.logger.info "Merged refmap data from {} annotation processor task(s) into {}", generated.size(), target
+    }
+    
+    /**
+     * Recursively merges the nodes of one refmap into another. Only the mappings
+     * node (class to member to mapping) needs merging, but this is done
+     * generically so that the structure of the refmap does not have to be known
+     * here.
+     * 
+     * @param target Node to merge into
+     * @param source Node to merge from
+     * @return the merged node
+     */
+    private Map mergeRefMapNodes(Map target, Map source) {
+        for (Entry entry : source.entrySet()) {
+            def value = entry.value
+            if (value instanceof Map) {
+                def existing = target[entry.key]
+                target[entry.key] = this.mergeRefMapNodes(existing instanceof Map ? new LinkedHashMap(existing) : [:], value)
+            } else if (!target.containsKey(entry.key)) {
+                target[entry.key] = value
+            }
+        }
+        
+        return target
+    }
+    
 
     /**
      * Generates an "imports" file given the currently specified imports. If the
@@ -687,8 +1104,8 @@ class MixinExtension {
      * @param compileTask Compile task for context
      * @return generated imports file or null if no imports in scope
      */
-    private File generateImportsFile(JavaCompile compileTask) {
-        File importsFile = new File(compileTask.temporaryDir, "mixin.imports.json")
+    private File generateImportsFile(Object compileTask) {
+        File importsFile = new File(this.getTemporaryDir(compileTask), "mixin.imports.json")
         importsFile.delete()
         
         Set<File> libs = []
