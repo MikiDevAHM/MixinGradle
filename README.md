@@ -26,7 +26,7 @@ buildscript {
         }
         dependencies {
             ...
-            classpath 'org.spongepowered:mixingradle:0.5-SNAPSHOT'
+            classpath 'org.spongepowered:MixinGradle:0.6-SNAPSHOT'
         }
 }
  ```
