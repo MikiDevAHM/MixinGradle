@@ -35,18 +35,33 @@ import static org.junit.Assert.assertFalse
 import static org.junit.Assert.assertTrue
 
 /**
- * Covers the claim that the Kotlin plugins may be applied before or after this
- * one. The detection is done with <tt>pluginManager.withPlugin</tt>, so it must
- * work whichever way round the plugins are applied, including the settings which
- * are changed at the moment a plugin is applied.
+ * Covers the two claims the Kotlin support rests on: that the Kotlin plugins
+ * may be applied before or after this one, and that they are detected however
+ * they are applied. The detection is done with
+ * <tt>pluginManager.withPlugin</tt>, so it has to work whichever way round the
+ * plugins are applied.
+ *
+ * Every id the Kotlin Gradle plugin is applied by is exercised, because a build
+ * which applies one that is not handled has its Kotlin sources skipped
+ * silently: the warning which would report that is itself only issued once the
+ * Kotlin plugin has been detected. Both of the Kotlin plugin's ids resolve to
+ * the same plugin, so handling either one is enough, and that is what these
+ * tests hold this plugin to.
  *
  * The Kotlin plugins are faked and registered under their real ids so that the
- * plugin manager fires the same callbacks it would in a real build.
+ * plugin manager fires the same callbacks it would in a real build. The real
+ * plugins cannot be used, because that would put the Kotlin Gradle plugin on
+ * the buildscript classpath.
  */
 class MixinExtensionApplyOrderTest {
 
-    private static final String KOTLIN_ID = 'org.jetbrains.kotlin.jvm'
-    private static final String KAPT_ID = 'kotlin-kapt'
+    /**
+     * Every id the Kotlin JVM plugin is applied by, and the kapt plugin is
+     * applied by. Both resolve to the same plugin classes, so all of them have
+     * to be detected.
+     */
+    private static final List<String> KOTLIN_IDS = ['org.jetbrains.kotlin.jvm', 'kotlin']
+    private static final List<String> KAPT_IDS = ['kotlin-kapt', 'org.jetbrains.kotlin.kapt']
 
     private Project projectWithJava() {
         Project project = ProjectBuilder.builder().build()
@@ -63,14 +78,19 @@ class MixinExtensionApplyOrderTest {
      */
     @Test
     void detectsKaptAppliedBeforeMixinGradle() {
-        Project project = this.projectWithJava()
-        project.pluginManager.apply(KOTLIN_ID)
-        project.pluginManager.apply(KAPT_ID)
+        KOTLIN_IDS.each { kotlinId ->
+            KAPT_IDS.each { kaptId ->
+                Project project = this.projectWithJava()
+                project.pluginManager.apply(kotlinId)
+                project.pluginManager.apply(kaptId)
 
-        MixinExtension extension = new MixinExtension(project)
+                MixinExtension extension = new MixinExtension(project)
 
-        assertTrue 'kapt must be detected', extension.kaptApplied
-        assertTrue 'the Kotlin plugin must be detected', extension.kotlinApplied
+                assertTrue "kapt must be detected when applied as '$kaptId'", extension.kaptApplied
+                assertTrue "the Kotlin plugin must be detected when applied as '$kotlinId'",
+                        extension.kotlinApplied
+            }
+        }
     }
 
     /**
@@ -79,16 +99,22 @@ class MixinExtensionApplyOrderTest {
      */
     @Test
     void detectsKaptAppliedAfterMixinGradle() {
-        Project project = this.projectWithJava()
+        KOTLIN_IDS.each { kotlinId ->
+            KAPT_IDS.each { kaptId ->
+                Project project = this.projectWithJava()
 
-        MixinExtension extension = new MixinExtension(project)
-        assertFalse 'nothing should be detected yet', extension.kaptApplied
+                MixinExtension extension = new MixinExtension(project)
+                assertFalse "nothing should be detected yet, '$kaptId'", extension.kaptApplied
 
-        project.pluginManager.apply(KOTLIN_ID)
-        project.pluginManager.apply(KAPT_ID)
+                project.pluginManager.apply(kotlinId)
+                project.pluginManager.apply(kaptId)
 
-        assertTrue 'kapt applied later must still be detected', extension.kaptApplied
-        assertTrue 'the Kotlin plugin applied later must still be detected', extension.kotlinApplied
+                assertTrue "kapt applied later as '$kaptId' must still be detected",
+                        extension.kaptApplied
+                assertTrue "the Kotlin plugin applied later as '$kotlinId' must still be detected",
+                        extension.kotlinApplied
+            }
+        }
     }
 
     /**
@@ -99,18 +125,20 @@ class MixinExtensionApplyOrderTest {
      */
     @Test
     void enablesJavacAnnotationProcessingWhicheverOrderThePluginsAreApplied() {
-        Project kaptFirst = this.projectWithJava()
-        kaptFirst.pluginManager.apply(KAPT_ID)
-        new MixinExtension(kaptFirst)
+        KAPT_IDS.each { kaptId ->
+            Project kaptFirst = this.projectWithJava()
+            kaptFirst.pluginManager.apply(kaptId)
+            new MixinExtension(kaptFirst)
 
-        Project mixinFirst = this.projectWithJava()
-        new MixinExtension(mixinFirst)
-        mixinFirst.pluginManager.apply(KAPT_ID)
+            Project mixinFirst = this.projectWithJava()
+            new MixinExtension(mixinFirst)
+            mixinFirst.pluginManager.apply(kaptId)
 
-        assertTrue 'kapt applied first',
-                kaptFirst.extensions.getByName('kapt').keepJavacAnnotationProcessors
-        assertTrue 'kapt applied last',
-                mixinFirst.extensions.getByName('kapt').keepJavacAnnotationProcessors
+            assertTrue "kapt applied first as '$kaptId'",
+                    kaptFirst.extensions.getByName('kapt').keepJavacAnnotationProcessors
+            assertTrue "kapt applied last as '$kaptId'",
+                    mixinFirst.extensions.getByName('kapt').keepJavacAnnotationProcessors
+        }
     }
 
     /**
@@ -120,23 +148,25 @@ class MixinExtensionApplyOrderTest {
      */
     @Test
     void findsTheKaptTaskWhicheverOrderThePluginsAreApplied() {
-        Project kaptFirst = this.projectWithJava()
-        kaptFirst.pluginManager.apply(KOTLIN_ID)
-        kaptFirst.pluginManager.apply(KAPT_ID)
-        MixinExtension first = new MixinExtension(kaptFirst)
+        KAPT_IDS.each { kaptId ->
+            Project kaptFirst = this.projectWithJava()
+            kaptFirst.pluginManager.apply(kaptId)
+            MixinExtension first = new MixinExtension(kaptFirst)
 
-        Project mixinFirst = this.projectWithJava()
-        MixinExtension second = new MixinExtension(mixinFirst)
-        mixinFirst.pluginManager.apply(KOTLIN_ID)
-        mixinFirst.pluginManager.apply(KAPT_ID)
+            Project mixinFirst = this.projectWithJava()
+            MixinExtension second = new MixinExtension(mixinFirst)
+            mixinFirst.pluginManager.apply(kaptId)
 
-        SourceSetContainer before = this.sourceSetsOf(kaptFirst)
-        SourceSetContainer after = this.sourceSetsOf(mixinFirst)
+            SourceSetContainer before = this.sourceSetsOf(kaptFirst)
+            SourceSetContainer after = this.sourceSetsOf(mixinFirst)
 
-        assertEquals 2, first.getProcessorTasks(before.getByName('main')).size()
-        assertEquals 2, second.getProcessorTasks(after.getByName('main')).size()
-        assertEquals 'kaptKotlin',
-                second.getKaptTask(after.getByName('main')).name
+            assertEquals "kapt applied first as '$kaptId'", 2,
+                    first.getProcessorTasks(before.getByName('main')).size()
+            assertEquals "kapt applied last as '$kaptId'", 2,
+                    second.getProcessorTasks(after.getByName('main')).size()
+            assertEquals "kapt applied last as '$kaptId'", 'kaptKotlin',
+                    second.getKaptTask(after.getByName('main')).name
+        }
     }
 
     /**

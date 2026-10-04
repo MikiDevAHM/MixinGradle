@@ -52,12 +52,18 @@ class MixinExtension {
     /**
      * Id of the Kotlin Gradle plugin. Only ever used as a string so that this
      * plugin does not need a compile time dependency on it.
+     *
+     * The Kotlin Gradle plugin also answers to the older 'kotlin' id, but both
+     * resolve to the same plugin, so watching either one is enough: the plugin
+     * manager matches an id against the plugin behind it rather than against
+     * the id itself.
      */
     private static final String KOTLIN_PLUGIN_ID = 'org.jetbrains.kotlin.jvm'
     
     /**
      * Id of the plugin which adds kapt, kapt is what actually runs the
-     * annotation processor for Kotlin sources.
+     * annotation processor for Kotlin sources. As above, 'kotlin-kapt' and
+     * 'org.jetbrains.kotlin.kapt' resolve to the same plugin.
      */
     private static final String KAPT_PLUGIN_ID = 'kotlin-kapt'
     
