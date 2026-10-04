@@ -22,11 +22,11 @@ To use **MixinGradle** you *must* be using **[ForgeGradle](MinecraftForge/ForgeG
  ```groovy
 buildscript {
         repositories {
-            <add source repository here>
+                maven { url 'https://jitpack.io' }
         }
         dependencies {
-            ...
-            classpath 'org.spongepowered:MixinGradle:0.6-SNAPSHOT'
+                ...
+                classpath 'com.github.MikiDevAHM:MixinGradle:0f11197'
         }
 }
  ```
