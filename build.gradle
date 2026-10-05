@@ -60,6 +60,9 @@ jar.manifest.mainAttributes (
 )
 
 task groovydocJar(type: Jar, dependsOn: groovydoc) {
+    // Without a classifier this jar writes to the exact same path as `jar`,
+    // so `assemble` silently overwrites the plugin jar with the javadoc.
+    archiveClassifier = 'javadoc'
     from groovydoc.destinationDir
 }
 
